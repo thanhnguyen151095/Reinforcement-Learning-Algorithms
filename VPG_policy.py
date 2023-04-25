@@ -5,7 +5,20 @@ from torch.optim import Adam
 import numpy as np
 import gym
 from gym.spaces import Discrete, Box
+import matplotlib
+import matplotlib.pyplot as plt
 
+"""
+device = torch.device('cpu')
+if(torch.cuda.is_available()): 
+    device = torch.device('cuda:0') 
+    torch.cuda.empty_cache()
+    print("Device set to : " + str(torch.cuda.get_device_name(device)))
+else:
+    print("Device set to : cpu")
+print("============================================================================================")
+
+"""
 
 def mlp(sizes, activation=nn.Tanh, output_activation=nn.Identity):
     # Build a feedforward neural network.
@@ -16,7 +29,7 @@ def mlp(sizes, activation=nn.Tanh, output_activation=nn.Identity):
     return nn.Sequential(*layers)
 
 def train(env_name='CartPole-v1', hidden_sizes=[32], lr=1e-2, 
-          epochs=50, batch_size=10000, render=False):
+          epochs = 100, batch_size=5000, render=False):
     # make enviroment, check spaces, get obs/act dimensions
     env = gym.make(env_name)
 
@@ -42,7 +55,9 @@ def train(env_name='CartPole-v1', hidden_sizes=[32], lr=1e-2,
         rtgs = np.zeros_like(rews)
         n = len(rews)
         for i in reversed(range(n)):
+
             rtgs[i] = rews[i] + (rtgs[i+1] if i+1 < n else 0)
+
 
         return rtgs
 
@@ -78,10 +93,6 @@ def train(env_name='CartPole-v1', hidden_sizes=[32], lr=1e-2,
         while True:
             
             # rendering 
-            """
-            if eppp > 40:
-                env.render()
-            """
             if (not finished_rendering_this_epoch) and render:
                 env.render()
 
@@ -128,15 +139,26 @@ def train(env_name='CartPole-v1', hidden_sizes=[32], lr=1e-2,
                                   weights=torch.as_tensor(batch_weights,dtype=torch.float32))
         batch_loss.backward()
         optimizer.step()
-        return batch_loss, batch_rets, batch_lens
+        return batch_loss, batch_rets, batch_lens, batch_size
 
     # training loop
+
+    TotalEnvInterects = []
+    Return_plot_mean = []
+    Return_plot_std = []
+
     for i in range(epochs):
-        batch_loss, batch_rets, batch_lens = train_one_epoch(i)
+        batch_loss, batch_rets, batch_lens, batch_size = train_one_epoch(i)
+
+        Return_plot_mean.append(np.mean(batch_rets))
+        Return_plot_std.append(np.std(batch_rets))
+        TotalEnvInterects.append(i*batch_size)
+
         print('epoch: %3d \t loss: %.3f \t return: %.3f \t ep_len: %.3f \t'% 
              (i,batch_loss, np.mean(batch_rets), np.mean(batch_lens)))
 
 
+    # show the interaction
     obs = env.reset()
     while True:
         act = get_action(torch.as_tensor(obs,dtype=torch.float32))
@@ -145,5 +167,27 @@ def train(env_name='CartPole-v1', hidden_sizes=[32], lr=1e-2,
         if done:
             break
 
+    # plotting
+    under_line = np.array(Return_plot_mean) - np.array(Return_plot_std)
+    upper_line = np.array(Return_plot_mean) + np.array(Return_plot_std)
 
-train()
+    plt.plot(TotalEnvInterects,Return_plot_mean, color='green')
+    plt.fill_between(TotalEnvInterects, upper_line, under_line, 
+        alpha=0.15, color='green')
+    plt.xlabel('TotalEnvInterects')
+    plt.ylabel('Performance')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+
+if __name__ == '__main__':
+
+    env_name = 'CartPole-v1'
+    hidden_sizes = [32]
+    lr = 1e-2
+    epochs = 60
+    batch_size = 5000
+    render = False
+
+    train(env_name, hidden_sizes, lr, epochs, batch_size, render)
