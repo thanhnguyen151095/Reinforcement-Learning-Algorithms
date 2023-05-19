@@ -1,6 +1,7 @@
 import torch  
 import torch.nn as nn
 from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.optim import Adam
 import numpy as np
 import gym
@@ -140,7 +141,7 @@ class PPOBuffer:
         self.ptr, self.path_start_idx = 0, 0
         # the next two lines implement the advantage normalization trick
         adv_mean, adv_std = mpi_statistics_scalar(self.adv_buf)
-        self.adv_buf = (self.adv_buf - adv_mean) / adv_std
+        self.adv_buf = (self.adv_buf - adv_mean) / (adv_std + 1e-7)
         data = dict(obs=self.obs_buf, act=self.act_buf, ret=self.ret_buf,
                     adv=self.adv_buf, logp=self.logp_buf)
         return {kk: torch.as_tensor(vv, dtype=torch.float32) for kk,vv in data.items()}
@@ -154,7 +155,94 @@ def mlp(sizes, activation=nn.Tanh, output_activation=nn.Identity):
         layers += [nn.Linear(sizes[j], sizes[j+1]), act()]
     return nn.Sequential(*layers)
 
-def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoch = 4000, epochs = 50, gamma = 0.99,
+class Actor(nn.Module):
+
+    def _distribution(self, obs):
+        raise NotImplementedError
+
+    def _log_prob_from_distribution(self, pi, act):
+        raise NotImplementedError
+
+    def forward(self, obs, act=None):
+        # Produce action distributions for given observations, and 
+        # optionally compute the log likelihood of given actions under
+        # those distributions.
+        pi = self._distribution(obs)
+        logp_a = None
+        if act is not None:
+            logp_a = self._log_prob_from_distribution(pi, act)
+        return pi, logp_a
+
+class MLPCategoricalActor(Actor):
+
+    def __init__(self,obs_dim,act_dim, hidden_sizes):
+        super().__init__()
+        self.logits_net = mlp(sizes = [obs_dim] + hidden_sizes + [act_dim])
+
+    def _distribution(self,obs):
+        logits = self.logits_net(obs)
+        return Categorical(logits=logits)
+
+    def _log_prob_from_distribution(self, pi, act):
+        return pi.log_prob(act)
+
+class MLPGaussianActor(Actor):
+
+    def __init__(self,obs_dim,act_dim,hidden_sizes):
+        super().__init__()
+        log_std = -0.5*np.ones(act_dim,dtype=np.float32)
+        self.log_std = torch.nn.Parameter(torch.as_tensor(log_std))
+        self.mu = mlp(sizes = [obs_dim] + hidden_sizes + [act_dim])
+
+    def _distribution(self,obs):
+        mu = self.mu(obs)
+        std = torch.exp(self.log_std)
+        return Normal(mu,std)
+
+    def _log_prob_from_distribution(self,pi,act):
+        return pi.log_prob(act).sum(axis=-1)  # Last axis sum needed for Torch Normal distribution
+
+class MLPCritic(nn.Module):
+
+    def __init__(self,obs_dim, hidden_sizes):
+        super().__init__()
+        self.v_net = mlp(sizes = [obs_dim] + hidden_sizes + [1])
+
+    def forward(self, obs):
+        return torch.squeeze(self.v_net(obs), -1) # Critical to ensure v has right shape.
+
+
+class MLPActorCritic(nn.Module):
+
+    def __init__(self, observation_space,action_space, hidden_sizes):
+        
+        super().__init__()
+        obs_dim = observation_space.shape[0]
+
+        # policy builder depends on action space
+        if isinstance(action_space,Box):
+            self.pi_net = MLPGaussianActor(obs_dim,action_space.shape[0],hidden_sizes)
+        elif isinstance(action_space,Discrete):
+            self.pi_net = MLPCategoricalActor(obs_dim,action_space.n,hidden_sizes)
+
+        # build value function    
+        self.v_net  = MLPCritic(obs_dim,hidden_sizes)
+
+    def step(self, obs):
+
+        with torch.no_grad():
+            pi = self.pi_net._distribution(obs)
+            a = pi.sample()
+            log_a = self.pi_net._log_prob_from_distribution(pi, a)
+            v = self.v_net(obs)
+
+        return a.numpy(), v.numpy(), log_a.numpy()
+
+    def act(self,obs):
+        return self.step(obs)[0]
+
+
+def PPO(env_name="Hopper-v4", hidden_sizes= [64]+[64],seed = 0, steps_per_epoch = 4000, epochs = 50, gamma = 0.99,
         clip_ratio = 0.2, pi_lr=3e-4,v_lr = 1e-3 , train_pi_iters = 80, train_v_iters = 80,
         lam = 0.97, max_ep_len = 1000, target_kl = 0.01, render=False):
         
@@ -170,44 +258,42 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
     # make enviroment, check spaces, get obs/act dimensions
     env = gym.make(env_name)
 
-    obs_dim = env.observation_space.shape[0]
-    n_acts = env.action_space.n
+    # obs_dim = env.observation_space.shape[0]
+    # n_acts = env.action_space.n
+    # act_dim = env.action_space.shape
+
+    obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape
 
 
-    # make a core policy network
-    policy_net = mlp(sizes = [obs_dim] + hidden_sizes + [n_acts])
-
-    # build  a value function network
-    value_net  = mlp(sizes = [obs_dim] + hidden_sizes + [1])
+    # make a actor-critic module
+    ac = MLPActorCritic(env.observation_space, env.action_space, hidden_sizes)
 
     # Sync params across processes
     #sync_params((policy_net , value_net))
 
-    sync_params(policy_net)
-    sync_params(value_net)
+    sync_params(ac)
 
     # Set up experience buffer
     local_steps_per_epoch = int(steps_per_epoch / num_procs()) # divided by the number of processors
     buf = PPOBuffer(obs_dim, act_dim, local_steps_per_epoch, gamma, lam)
     
-    def policy_value_nets_step(obs):
-        with torch.no_grad():
-            pi = Categorical(logits = policy_net(obs))
-            act = pi.sample()
-            logp_a = pi.log_prob(act)
+    # def policy_value_nets_step(obs):
+    #     with torch.no_grad():
+    #         pi = Categorical(logits = policy_net(obs))
+    #         act = pi.sample()
+    #         logp_a = pi.log_prob(act)
 
-            v = torch.squeeze(value_net(obs),-1) # Critical to ensure v has right shape.
+    #         v = torch.squeeze(value_net(obs),-1) # Critical to ensure v has right shape.
 
 
-        return act.numpy(), logp_a.numpy(), v.numpy()
+    #     return act.numpy(), logp_a.numpy(), v.numpy()
 
     def compute_loss_pi(data):
         obs, act, adv, logp_old = data['obs'], data['act'], data['adv'], data['logp']
 
         # Policy loss
-        pi = Categorical(logits = policy_net(obs))
-        logp = pi.log_prob(act)
+        pi, logp = ac.pi_net(obs, act)
         ratio = torch.exp(logp - logp_old)
         clip_adv = torch.clamp(ratio, 1-clip_ratio, 1+clip_ratio) * adv
         loss_pi = -(torch.min(ratio * adv, clip_adv)).mean()
@@ -223,11 +309,15 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
 
     def compute_loss_v(data):
         obs, ret = data['obs'], data['ret']
-        return ((torch.squeeze(value_net(obs),-1) - ret)**2).mean()
+        # print(obs)
+        # print(ret)
+        # print(ac.v_net(obs))
+        # time.sleep(4)
+        return ((ac.v_net(obs) - ret)**2).mean()
 
     # make optimizer
-    pi_optimizer = Adam(policy_net.parameters(), lr = pi_lr)
-    v_optimizer = Adam(value_net.parameters(), lr = v_lr)
+    pi_optimizer = Adam(ac.pi_net.parameters(), lr = pi_lr)
+    v_optimizer = Adam(ac.v_net.parameters(), lr = v_lr)
 
     # Prepare for interaction with enviroment
     start_time = time.time()
@@ -245,7 +335,10 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
         for t in range(local_steps_per_epoch):
             #env.render()
 
-            a, logp, v = policy_value_nets_step(torch.as_tensor(o, dtype=torch.float32))
+            a, v, logp = ac.step(torch.as_tensor(o, dtype=torch.float32))
+            # print(a)
+            # print(v)
+            # print(logp)
             next_o, r, done, _ = env.step(a)
             ep_ret += r
             ep_len += 1
@@ -266,7 +359,7 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
 
                 # if trajectory didn't reach the terminal state, bootstrap value target 
                 if timeout or epoch_ended:
-                    _, _, v = policy_value_nets_step(torch.as_tensor(o, dtype=torch.float32))
+                    _, v, _ = ac.step(torch.as_tensor(o, dtype=torch.float32))
                 else:
                     v = 0 
                 buf.finish_path(v)
@@ -291,7 +384,7 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
                 print('Early stopping at step %d due to reaching max kl.'%i)
                 break
             loss_pi.backward()
-            mpi_avg_grads(policy_net) # average grads across MPI processes
+            mpi_avg_grads(ac.pi_net) # average grads across MPI processes
             pi_optimizer.step()
 
         
@@ -300,7 +393,7 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
             v_optimizer.zero_grad()
             loss_v = compute_loss_v(data)
             loss_v.backward()
-            mpi_avg_grads(value_net) # average grads across MPI processes
+            mpi_avg_grads(ac.v_net) # average grads across MPI processes
             v_optimizer.step()
 
 
@@ -312,17 +405,17 @@ def PPO(env_name='CartPole-v1', hidden_sizes= [64]+[64],seed = 0, steps_per_epoc
         TotalEnvInterects.append(epoch*local_steps_per_epoch)
 
     # save a policy model
-    torch.save(policy_net.state_dict(), '/home/win/spinningup/spinup/examples/pytorch/pg_math/pi_ppo.pth')
-    torch.save(value_net.state_dict(), '/home/win/spinningup/spinup/examples/pytorch/pg_math/v_ppo.pth')
+    torch.save(ac.pi_net.state_dict(), '/home/win/spinningup/spinup/examples/pytorch/pg_math/pi_ppo.pth')
+    torch.save(ac.v_net.state_dict(), '/home/win/spinningup/spinup/examples/pytorch/pg_math/v_ppo.pth')
     
     # show the interaction
-    obs = env.reset()
-    while True:
-        act, _, _ = policy_value_nets_step(torch.as_tensor(obs, dtype=torch.float32))
-        obs, rew, done, _ = env.step(act)
-        env.render()
-        if done:
-            break
+    # obs = env.reset()
+    # while True:
+    #     act, _, _ = policy_value_nets_step(torch.as_tensor(obs, dtype=torch.float32))
+    #     obs, rew, done, _ = env.step(act)
+    #     env.render()
+    #     if done:
+    #         break
 
     # plotting
     under_line = np.array(Return_plot_mean) - np.array(Return_plot_std)
@@ -346,7 +439,8 @@ if __name__ == '__main__':
 
     mpi_fork(args.cpu)
 
-    env_name = 'CartPole-v1'
+    env_name = 'InvertedPendulum-v2' #'InvertedPendulum-v2'
+    #env_name = 'InvertedPendulum-v2'
     hidden_sizes = [64] + [64]
     seed = 0
     steps_per_epoch = 4000
@@ -365,4 +459,3 @@ if __name__ == '__main__':
     PPO(env_name, hidden_sizes,seed, steps_per_epoch, epochs, 
         gamma , clip_ratio , pi_lr,v_lr , train_pi_iters, 
         train_v_iters, lam, max_ep_len, target_kl, render)
-    
