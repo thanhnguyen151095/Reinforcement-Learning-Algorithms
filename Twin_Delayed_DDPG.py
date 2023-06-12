@@ -155,9 +155,9 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
 
             # Target policy smoothing
             a2 = ac_targ.pi(o2) 
-            a2 = a2 
-            ns = np.clip(target_noise*np.random.randn(act_dim), -noise_clip,noise_clip)
-            a2 = np.clip(a2 + torch.as_tensor(ns,dtype=torch.float32), -act_limit, act_limit)
+            ns = torch.randn_like(a2) * target_noise
+            ns = torch.clamp(ns, -noise_clip, noise_clip)
+            a2 = torch.clamp(a2 + ns, -act_limit, act_limit)
 
             # Target Q-values
             q1_pi_targ = ac_targ.q1(o2,a2)
