@@ -88,7 +88,7 @@ class MLPQFunction(nn.Module):
 
 class MLPActorCritic(nn.Module):
 
-    def __init__(self, observation_space, action_space, hidden_sizes=[256] + [256], 
+    def __init__(self, observation_space, action_space, hidden_sizes=[256]+[256], 
                  activation=nn.ReLU):
         super().__init__()
         obs_dim = observation_space.shape[0]
@@ -96,8 +96,8 @@ class MLPActorCritic(nn.Module):
         act_limit = action_space.high[0]
 
         # build policy
-        self.pi = MLPActor(obs_dim,action_space.shape[0],hidden_sizes,activation,act_limit)
-        # build value function    
+        self.pi = MLPActor(obs_dim,act_dim,hidden_sizes,activation,act_limit)
+        # build value functions    
         self.q1  = MLPQFunction(obs_dim,act_dim,hidden_sizes,activation)
         self.q2  = MLPQFunction(obs_dim,act_dim,hidden_sizes,activation)
 
@@ -105,9 +105,6 @@ class MLPActorCritic(nn.Module):
         with torch.no_grad():
             return self.pi(obs).numpy()
 
-        # env_name="Hopper-v4", hidden_sizes= [64]+[64],seed = 0, steps_per_epoch = 4000, epochs = 50, gamma = 0.99,
-        # clip_ratio = 0.2, pi_lr=3e-4,v_lr = 1e-3 , train_pi_iters = 80, train_v_iters = 80,
-        # lam = 0.97, max_ep_len = 1000, target_kl = 0.01, render=False
 
 def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0, 
          steps_per_epoch=4000, epochs=100, replay_size=int(1e6), gamma=0.99, 
@@ -122,7 +119,7 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
 
     # make enviroment, check spaces, get obs/act dimensions
     env = gym.make(env_name)
-    test_env = gym.make(env_name)
+    test_env = env
 
     obs_dim = env.observation_space.shape
     act_dim = env.action_space.shape[0]
@@ -161,14 +158,14 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
 
             # Target Q-values
             q1_pi_targ = ac_targ.q1(o2,a2)
-            q2_pi_targ = ac_targ.q1(o2,a2)
+            q2_pi_targ = ac_targ.q2(o2,a2)
 
-            q_pi_targ = torch.min(q1_pi_targ,q2_pi_targ)
-            backup = r + gamma * (1-d) * q_pi_targ
+            q_pi_targ = torch.min(q1_pi_targ, q2_pi_targ)
+            backup = r + gamma * (1 - d) * q_pi_targ
 
         # MSE loss against Bellman backup
         loss_q1 = ((q1- backup)**2).mean()
-        loss_q2 = ((q1- backup)**2).mean()
+        loss_q2 = ((q2- backup)**2).mean()
         loss_q = loss_q1 + loss_q2
 
         # Useful info for logging
@@ -177,11 +174,15 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
 
         return loss_q, loss_info
 
-
+    # Set up function for computing TD3 pi loss
     def compute_loss_pi(data):
         o = data['obs']
         q1_pi = ac.q1(o,ac.pi(o))
         return -q1_pi.mean()
+
+    # make optimizer for policy and q-function
+    pi_optimizer = Adam(ac.pi.parameters(), lr = pi_lr)
+    q_optimizer = Adam(q_params, lr = q_lr)
 
     def update(data, timer):
         # First run one gradient descent step for Q.
@@ -190,9 +191,10 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
         loss_q.backward()
         q_optimizer.step()
 
-        # Freeze Q-network so you don't waste computational effort
-        # computing gradients for it during the policy learning step
-        if timer % policy_delay ==0:
+        # Possibly update pi and target networks
+        if timer % policy_delay == 0:
+            # Freeze Q-networks so you don't waste computational effort 
+            # computing gradients for them during the policy learning step.
 
             for p in q_params:
                 p.requires_grad = False
@@ -238,15 +240,12 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
         return ep_return_mean, ep_return_std
 
 
-
-    # make optimizer for policy and q-function
-    pi_optimizer = Adam(ac.pi.parameters(), lr = pi_lr)
-    q_optimizer = Adam(q_params, lr = q_lr)
-
     # Prepare for interaction with enviroment
     total_steps = steps_per_epoch * epochs
     o, ep_ret, ep_len = env.reset(), 0, 0
     start_time = time.time()
+
+
     # Main loop: collect experience in env and update/log each epoch
     Return_plot_mean = []
     Return_plot_std = []
@@ -267,6 +266,11 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
         ep_ret += r
         ep_len += 1
 
+        # Ignore the "done" signal if it comes from hitting the time
+        # horizon (that is, when it's an artificial terminal signal
+        # that isn't based on the agent's state)
+        d = False if ep_len==max_ep_len else d
+
         # save 
         replay_buffer.store(o, a, r, o2, d)
 
@@ -283,6 +287,7 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
                 batch = replay_buffer.sample_batch(batch_size)
                 update(data=batch,timer=j)
 
+        # End of epoch handling
         if (t+1) % steps_per_epoch == 0:
             ep_rt_mean, ep_rt_std = test_agent()
             Return_plot_mean.append(ep_rt_mean)
@@ -294,7 +299,7 @@ def td3(env_name='InvertedPendulum-v2',hidden_sizes = [256] + [256], seed=0,
             TotalEnvInterects.append(t)
 
     # save a policy model
-    torch.save(ac.pi.state_dict(), '/home/win/spinningup/spinup/code_NGUYEN/pi_ddpg.pth')
+    torch.save(ac.pi.state_dict(), '/home/win/spinningup/spinup/code_NGUYEN/pi_td3.pth')
 
     # plotting
     under_line = np.array(Return_plot_mean) - np.array(Return_plot_std)
